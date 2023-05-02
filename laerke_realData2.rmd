@@ -1,0 +1,369 @@
+---
+title: "Assignment_3"
+output: html_document
+date: "2023-04-20"
+---
+
+```{r}
+pacman::p_load(
+  tidyverse,
+  brms,
+  cmdstanr,
+  patchwork
+)
+```
+
+
+
+
+# Loading and preprocessing the data
+```{r Data simulation}
+# Loading the data
+data <- read.csv("Simonsen_clean.csv")
+
+# Filtering the data from just a single participant
+data <- filter(data, ID == 201)
+
+
+data$FirstRating <- data$FirstRating / 9
+data$GroupRating <- data$GroupRating / 9
+```
+
+
+##PLOTS:
+```{r}
+# xxx What actually is belief? Is it in this data?
+
+# p1 <- ggplot(data, aes(belief)) +
+#   geom_histogram(bins = 10, alpha = 0.3, color = "black") +
+#   theme_bw()
+# 
+# p2 <- ggplot(data, aes(FirstRating, belief, color = GroupRating, group = GroupRating)) +
+#   geom_line() +
+#   theme_bw()
+# 
+# p1 + p2
+```
+
+
+
+```{r}
+p3 <- ggplot(data, aes(SecondRating)) +
+  geom_histogram(bins = 10, alpha = 0.3, color = "black") +
+  theme_bw()
+
+p4 <- ggplot(data, aes(FirstRating, SecondRating, color = GroupRating, group = GroupRating)) +
+  geom_smooth(method = "lm", se = F) +
+  theme_bw()
+
+p3 + p4
+```
+
+
+##data for STAN
+```{r}
+data_simpleBayes <- list(
+  N = nrow(data),
+  y = data$SecondRating/9, # putting it on a 0-1 scale
+  FirstRating = data$FirstRating,
+  GroupRating = data$GroupRating
+)
+```
+
+##Create the Stan Model
+```{r}
+stan_simpleBayes_model <- "
+data {
+  int<lower=0> N;
+  array[N] real y;
+  array[N] real<lower=0, upper = 1> FirstRating;
+  array[N] real<lower=0, upper = 1> GroupRating;
+}
+
+transformed data{
+  array[N] real l_y;
+  array[N] real l_FirstRating;
+  array[N] real l_GroupRating;
+  l_y = logit(y);
+  l_FirstRating = logit(FirstRating);
+  l_GroupRating = logit(GroupRating);
+}
+
+parameters {
+  real sd;
+  real bias;
+}
+
+model {
+  target +=  normal_lpdf(sd | 0, 1) - normal_lccdf(0 | 0, 1); # adding prior for sd, and making sure that it only goes above 0;
+  target +=  normal_lpdf(bias | 0, 1);
+  target +=  normal_lpdf(to_vector(l_y) | bias + to_vector(l_FirstRating) + to_vector(l_GroupRating), sd);
+}
+
+generated quantities{
+  real sd_prior;
+  real bias_prior;
+  array[N] real log_lik;
+  
+  sd_prior = normal_rng(0, 1);
+  bias_prior = normal_rng(0, 1);
+  
+  for (n in 1:N){  
+    log_lik[n] = normal_lpdf(l_y[n] | bias + l_FirstRating[n] +  l_GroupRating[n], sd);
+  }
+  
+}
+
+"
+
+write_stan_file(
+  stan_simpleBayes_model,
+  dir = "stan/",
+  basename = "W9_SimpleBayes.stan")
+```
+
+```{r}
+file <- file.path("stan/W9_SimpleBayes.stan")
+mod_simpleBayes <- cmdstan_model(file, cpp_options = list(stan_threads = TRUE),
+                     stanc_options = list("O1"))
+```
+
+#Fitting the model
+```{r}
+samples_simple <- mod_simpleBayes$sample(
+  data = data_simpleBayes,
+  #fixed_param = TRUE,
+  seed = 123,
+  chains = 2,
+  parallel_chains = 2,
+  threads_per_chain = 2,
+  iter_warmup = 1500,
+  iter_sampling = 3000,
+  refresh = 500
+)
+```
+
+```{r}
+samples_simple$cmdstan_diagnose()
+```
+
+```{r}
+samples_simple$summary()
+```
+
+
+
+
+```{r}
+samples_simple$loo()
+```
+
+```{r}
+draws_df <- as_draws_df(samples_simple$draws())
+
+chain1 <- ggplot(draws_df, aes(.iteration, bias, group = .chain, color = .chain)) +
+  geom_line(alpha = 0.5) +
+  theme_classic()
+
+chain2 <- ggplot(draws_df, aes(.iteration, bias, group = .chain, color = .chain)) +
+  geom_line(alpha = 0.5) +
+  theme_classic()
+
+chain1+chain2
+```
+
+```{r}
+plot1 <- ggplot(draws_df) +
+  geom_density(aes(bias), alpha = 0.6, fill = "lightblue") +
+  geom_density(aes(bias_prior), alpha = 0.6, fill = "pink") +
+  theme_bw()
+
+plot2 <- ggplot(draws_df) +
+  geom_density(aes(sd), alpha = 0.6, fill = "lightblue") +
+  geom_density(aes(sd_prior), alpha = 0.6, fill = "pink") +
+  theme_bw()
+
+plot1+plot2
+```
+
+
+
+
+
+
+
+### Weighted Bayes
+
+## Data for STAN
+```{r}
+data_weightedBayes <- list(
+  N = nrow(data),
+  y = data$SecondRating/9,
+  FirstRating = data$FirstRating,
+  GroupRating = data$GroupRating
+)
+```
+
+
+##STAN WB
+```{r}
+stan_WB_model <- "
+data {
+  int<lower=0> N;
+  array[N] real y;
+  array[N] real <lower = 0, upper = 1> FirstRating; 
+  array[N] real <lower = 0, upper = 1> GroupRating; 
+}
+
+transformed data {
+  array[N] real l_y;
+  array[N] real l_FirstRating;
+  array[N] real l_GroupRating;
+  l_y = logit(y);
+  l_FirstRating = logit(FirstRating);
+  l_GroupRating = logit(GroupRating);
+}
+
+parameters {
+  real sd;
+  real bias;
+  // meaningful weights are btw 0.5 and 1 (theory reasons)
+  real<lower = 0.5, upper = 1> w1; 
+  real<lower = 0.5, upper = 1> w2;
+}
+
+transformed parameters {
+  real<lower = 0, upper = 1> weight1;
+  real<lower = 0, upper = 1> weight2;
+  // weight parameters are rescaled to be on a 0-1 scale (0 -> no effects; 1 -> face value)
+  weight1 = (w1 - 0.5) * 2;  
+  weight2 = (w2 - 0.5) * 2;
+}
+
+model {
+  target += normal_lpdf(sd | 0, 1) - normal_lccdf(0 | 0, 1);;
+  target += normal_lpdf(bias | 0, 1);
+  target += beta_lpdf(weight1 | 1, 1);
+  target += beta_lpdf(weight2 | 1, 1);
+  for (n in 1:N)
+    target += normal_lpdf(l_y[n] | bias + weight1 *l_FirstRating[n] + weight2 * l_GroupRating[n], sd); 
+    // xxx vector?
+}
+generated quantities{
+  array[N] real log_lik;
+  real sd_prior;
+  real bias_prior;
+  real w1_prior;
+  real w2_prior;
+  bias_prior = normal_rng(0, 1) ;
+  sd_prior = normal_rng(0, 1) ;
+  w1_prior = 0.5 + inv_logit(normal_rng(0, 1))/2 ;
+  w2_prior = 0.5 + inv_logit(normal_rng(0, 1))/2 ;
+  for (n in 1:N)
+    log_lik[n]= normal_lpdf(l_y[n] | bias + weight1 * l_FirstRating[n] + weight2 * l_GroupRating[n], sd);
+}
+
+"
+
+write_stan_file(
+  stan_WB_model,
+  dir = "stan/",
+  basename = "W9_WB.stan")
+```
+
+```{r}
+file <- file.path("stan/W9_WB.stan")
+mod_wb <- cmdstan_model(file, cpp_options = list(stan_threads = TRUE),
+                     stanc_options = list("O1"))
+```
+
+#Fitting the model
+```{r}
+
+samples_weighted <- mod_wb$sample(
+  data = data_weightedBayes,
+  seed = 123,
+  chains = 2,
+  parallel_chains = 2,
+  threads_per_chain = 2,
+  iter_warmup = 1500,
+  iter_sampling = 3000,
+  refresh = 500
+)
+```
+
+#Model evaluation
+```{r}
+samples_weighted$cmdstan_diagnose()
+```
+
+```{r}
+samples_weighted$summary()
+```
+
+```{r}
+samples_weighted$loo()
+```
+
+```{r}
+draws_df <- as_draws_df(samples_weighted$draws())
+
+cp1 <- ggplot(draws_df, aes(.iteration, bias, group = .chain, color = .chain)) +
+  geom_line(alpha = 0.5) +
+  theme_classic()
+
+cp2 <- ggplot(draws_df, aes(.iteration, sd, group = .chain, color = .chain)) +
+  geom_line(alpha = 0.5) +
+  theme_classic()
+
+cp3 <- ggplot(draws_df, aes(.iteration, w1, group = .chain, color = .chain)) +
+  geom_line(alpha = 0.5) +
+  theme_classic()
+
+cp4 <- ggplot(draws_df, aes(.iteration, w2, group = .chain, color = .chain)) +
+  geom_line(alpha = 0.5) +
+  theme_classic()
+
+cp1 + cp2 + cp3 + cp4
+```
+
+
+```{r}
+pp1 <- ggplot(draws_df) +
+  geom_density(aes(bias), alpha = 0.6, fill = "lightblue") +
+  geom_density(aes(bias_prior), alpha = 0.6, fill = "pink") +
+  theme_bw()
+
+pp2 <- ggplot(draws_df) +
+  geom_density(aes(sd), alpha = 0.6, fill = "lightblue") +
+  geom_density(aes(sd_prior), alpha = 0.6, fill = "pink") +
+  theme_bw()
+
+pp3 <- ggplot(draws_df) +
+  geom_density(aes(w1), alpha = 0.6, fill = "lightblue") +
+  geom_density(aes(w1_prior), alpha = 0.6, fill = "pink") +
+  theme_bw()
+
+pp4 <- ggplot(draws_df) +
+  geom_density(aes(w2), alpha = 0.6, fill = "lightblue") +
+  geom_density(aes(w2_prior), alpha = 0.6, fill = "pink") +
+  theme_bw()
+
+pp1 + pp2 + pp3 + pp4
+```
+
+```{r}
+scat1 <- ggplot(draws_df) +
+  geom_point(aes(bias, w1), alpha = 0.3) +
+  theme_bw()
+
+scat2 <- ggplot(draws_df) +
+  geom_point(aes(sd, w1), alpha = 0.3) +
+  theme_bw()
+
+scat1 + scat2
+```
+
+
+
+

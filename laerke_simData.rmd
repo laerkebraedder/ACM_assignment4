@@ -1,0 +1,492 @@
+---
+title: "Assignment_3"
+output: html_document
+date: "2023-04-20"
+---
+
+```{r}
+pacman::p_load(
+  tidyverse,
+  brms,
+  cmdstanr,
+  patchwork
+)
+```
+
+```{r The function}
+SimpleBayes_f <- function(bias, Source1, Source2){
+  
+  outcome <- inv_logit_scaled(bias + 0.5*logit_scaled(Source1) + 0.5*logit_scaled(Source2))
+  
+  return(outcome)
+  
+}
+```
+
+
+
+# Simulating the data
+```{r Data simulation}
+bias <- 0
+trials <- seq(80)
+FirstRating <- NA
+GroupRating <- NA
+adjustments <- c(-3, -2, 0, 2, 3)
+
+# Putting our variables bias and sources into a data frame of length trials
+db <- expand.grid(bias = bias, trials = trials, FirstRating = FirstRating, GroupRating = GroupRating)
+
+# Looping over the rows to create the first rating, and then create the rating of the other person (this other rating is dependent on the first rating, since they cannot be too far apart)
+for (i in trials) {
+  db$trials[i] = i
+  db$FirstRating[i] = sample(seq(8), 1)
+  db$GroupRating[i] = db$FirstRating[i] + sample(adjustments, 1)
+  while (db$GroupRating[i] < 1 | db$GroupRating[i] > 8) {
+    db$GroupRating[i] = db$FirstRating[i] + sample(adjustments, 1)
+  }
+}
+
+db$FirstRating <- db$FirstRating / 9
+db$GroupRating <- db$GroupRating / 9
+
+for (n in seq(nrow(db))) {
+  db$belief[n] <- SimpleBayes_f(db$bias[n], db$FirstRating[n], db$GroupRating[n])
+  db$choice[n] <- rbinom(1,1, db$belief[n]) #xxx delete maybe?
+  db$SecondRating[n] <- round(db$belief[n]*9, 0) # outcome in rating
+}
+
+
+```
+
+
+##PLOTS:
+```{r}
+p1 <- ggplot(db, aes(belief)) +
+  geom_histogram(bins = 10, alpha = 0.3, color = "black") +
+  theme_bw()
+
+p2 <- ggplot(db, aes(FirstRating, belief, color = GroupRating, group = GroupRating)) +
+  geom_line() +
+  theme_bw()
+
+p1 + p2
+```
+
+
+
+```{r}
+p3 <- ggplot(db, aes(SecondRating)) +
+  geom_histogram(bins = 10, alpha = 0.3, color = "black") +
+  theme_bw()
+
+p4 <- ggplot(db, aes(FirstRating, SecondRating, color = GroupRating, group = GroupRating)) +
+  geom_smooth(method = "lm", se = F) +
+  theme_bw()
+
+p3 + p4
+```
+
+
+##data fir STAN
+```{r}
+data_simpleBayes <- list(
+  N = nrow(db),
+  y = db$SecondRating/9, # putting it on a 0-1 scale
+  FirstRating = db$FirstRating,
+  GroupRating = db$GroupRating
+)
+```
+
+##Create the Stan Model
+```{r}
+stan_simpleBayes_model <- "
+data {
+  int<lower=0> N;
+  array[N] real y;
+  array[N] real<lower=0, upper = 1> FirstRating;
+  array[N] real<lower=0, upper = 1> GroupRating;
+}
+
+transformed data{
+  array[N] real l_y;
+  array[N] real l_FirstRating;
+  array[N] real l_GroupRating;
+  l_y = logit(y);
+  l_FirstRating = logit(FirstRating);
+  l_GroupRating = logit(GroupRating);
+}
+
+parameters {
+  real sd;
+  real bias;
+}
+
+model {
+  target +=  normal_lpdf(sd | 0, 1) - normal_lccdf(0 | 0, 1); # adding prior for sd, and making sure that it only goes above 0;
+  target +=  normal_lpdf(bias | 0, 1);
+  target +=  normal_lpdf(to_vector(l_y) | bias + to_vector(l_FirstRating) + to_vector(l_GroupRating), sd);
+}
+
+generated quantities{
+  real sd_prior;
+  real bias_prior;
+  array[N] real log_lik;
+  
+  sd_prior = normal_rng(0, 1);
+  bias_prior = normal_rng(0, 1);
+  
+  for (n in 1:N){  
+    log_lik[n] = normal_lpdf(l_y[n] | bias + l_FirstRating[n] +  l_GroupRating[n], sd);
+  }
+  
+}
+
+"
+
+write_stan_file(
+  stan_simpleBayes_model,
+  dir = "stan/",
+  basename = "W9_SimpleBayes.stan")
+```
+
+```{r}
+file <- file.path("stan/W9_SimpleBayes.stan")
+mod_simpleBayes <- cmdstan_model(file, cpp_options = list(stan_threads = TRUE),
+                     stanc_options = list("O1"))
+```
+#Fitting the model
+```{r}
+samples_simple <- mod_simpleBayes$sample(
+  data = data_simpleBayes,
+  #fixed_param = TRUE,
+  seed = 123,
+  chains = 2,
+  parallel_chains = 2,
+  threads_per_chain = 2,
+  iter_warmup = 1500,
+  iter_sampling = 3000,
+  refresh = 500
+)
+```
+
+```{r}
+samples_simple$cmdstan_diagnose()
+```
+
+```{r}
+samples_simple$summary()
+```
+```{r}
+3.393921e-04
+```
+
+
+
+```{r}
+samples_simple$loo()
+```
+
+```{r}
+draws_df <- as_draws_df(samples_simple$draws())
+
+cp1 <- ggplot(draws_df, aes(.iteration, bias, group = .chain, color = .chain)) +
+  geom_line(alpha = 0.5) +
+  theme_classic()
+
+cp2 <- ggplot(draws_df, aes(.iteration, sd, group = .chain, color = .chain)) +
+  geom_line(alpha = 0.5) +
+  theme_classic()
+
+cp1+cp2
+```
+
+```{r}
+pp1 <- ggplot(draws_df) +
+  geom_density(aes(bias), alpha = 0.6, fill = "lightblue") +
+  geom_density(aes(bias_prior), alpha = 0.6, fill = "pink") +
+  geom_vline(xintercept = db$bias[1]) +
+  theme_bw()
+
+pp2 <- ggplot(draws_df) +
+  geom_density(aes(sd), alpha = 0.6, fill = "lightblue") +
+  geom_density(aes(sd_prior), alpha = 0.6, fill = "pink") +
+  theme_bw()
+
+pp1+pp2
+```
+
+
+
+
+
+
+### Weighted Bayes
+```{r}
+WeightedBayes_f <- function(bias, FirstRating, GroupRating, w1, w2){
+  w1 <- (w1 - 0.5)*2
+  w2 <- (w2 - 0.5)*2
+  outcome <- inv_logit_scaled(bias + w1 * logit_scaled(FirstRating) + w2 * logit_scaled(GroupRating))
+  return(outcome)
+}
+
+
+
+## The weight_f formula comes from https://www.nature.com/articles/ncomms14218 and ensures that even if we work on a log-odds scale, we get the right weights. It takes all values of L (- inf to +inf). Technically the only valid values for w are 0.5 (no consideration of the evidence) to 1 (taking the evidence at face value).
+## In practice the function would also accept 0-0.5 (invert the evidence, at face value if 0, at decreased value as it grows towards 0.5), and slightly higher than 1 (overweighing the evidence, but it's very unstable and quickly gives NaN).
+weight_f <- function(L, w){
+  return(log((w * exp(L) + 1 - w) / 
+        ((1 - w) * exp(L) + w)))
+      }
+```
+
+
+```{r}
+bias <- 0
+trials <- seq(80)
+FirstRating <- NA
+GroupRating <- NA
+w1 <- 0.7
+w2 <- 0.9
+adjustments <- c(-3, -2, 0, 2, 3)
+
+db <- expand.grid(bias = bias, trials = trials, FirstRating = FirstRating, GroupRating = GroupRating, w1 = w1, w2 = w2)
+
+for (i in seq(nrow(db))) {
+  db$FirstRating[i] = sample(seq(8), 1)
+  db$GroupRating[i] = db$FirstRating[i] + sample(adjustments, 1)
+  while (db$GroupRating[i] < 1 | db$GroupRating[i] > 8) {
+    db$GroupRating[i] = db$FirstRating[i] + sample(adjustments, 1)
+  }
+}
+
+db$FirstRating <- db$FirstRating / 9
+db$GroupRating <- db$GroupRating / 9
+
+
+for (n in seq(nrow(db))) {
+  db$belief[n] <- WeightedBayes_f(db$bias[n], db$FirstRating[n], db$GroupRating[n], db$w1[n], db$w2[n])
+  db$SecondRating[n] <- round(db$belief[n] * 9, 0)
+}
+```
+
+
+
+```{r}
+#xxx Make sure to use the right version of variable
+p5 <- ggplot(db, aes(FirstRating, belief, color = GroupRating, group = GroupRating)) +
+  geom_line() +
+  theme_bw()
+
+p6 <- ggplot(db, aes(belief)) +
+  geom_histogram(bins = 10, alpha = 0.3, color = "black") +
+  theme_bw()
+
+p5 + p6
+```
+
+
+
+```{r}
+#xxx Make sure to use the right version of variable
+p7 <- ggplot(db, aes(FirstRating, SecondRating, color = GroupRating, group = GroupRating)) +
+  geom_line() +
+  theme_bw()
+
+p8 <- ggplot(db, aes(SecondRating)) +
+  geom_histogram(bins = 10, alpha = 0.3, color = "black") +
+  theme_bw()
+
+p7 + p8
+```
+
+
+
+
+## Data for STAN
+```{r}
+data_weightedBayes <- list(
+  N = nrow(db),
+  y = db$SecondRating/9,
+  FirstRating = db$FirstRating,
+  GroupRating = db$GroupRating
+)
+```
+
+
+##STAN WB
+```{r}
+stan_WB_model <- "
+data {
+  int<lower=0> N;
+  array[N] real y;
+  array[N] real <lower = 0, upper = 1> FirstRating; 
+  array[N] real <lower = 0, upper = 1> GroupRating; 
+}
+
+transformed data {
+  array[N] real l_y;
+  array[N] real l_FirstRating;
+  array[N] real l_GroupRating;
+  l_y = logit(y);
+  l_FirstRating = logit(FirstRating);
+  l_GroupRating = logit(GroupRating);
+}
+
+parameters {
+  real sd;
+  real bias;
+  // meaningful weights are btw 0.5 and 1 (theory reasons)
+  real<lower = 0.5, upper = 1> w1; 
+  real<lower = 0.5, upper = 1> w2;
+}
+
+transformed parameters {
+  real<lower = 0, upper = 1> weight1;
+  real<lower = 0, upper = 1> weight2;
+  // weight parameters are rescaled to be on a 0-1 scale (0 -> no effects; 1 -> face value)
+  weight1 = (w1 - 0.5) * 2;  
+  weight2 = (w2 - 0.5) * 2;
+}
+
+model {
+  target += normal_lpdf(sd | 0, 1) - normal_lccdf(0 | 0, 1);;
+  target += normal_lpdf(bias | 0, 1);
+  target += beta_lpdf(weight1 | 1, 1);
+  target += beta_lpdf(weight2 | 1, 1);
+  for (n in 1:N)
+    target += normal_lpdf(l_y[n] | bias + weight1 *l_FirstRating[n] + weight2 * l_GroupRating[n], sd); 
+    // xxx vector?
+}
+generated quantities{
+  array[N] real log_lik;
+  real sd_prior;
+  real bias_prior;
+  real w1_prior;
+  real w2_prior;
+  bias_prior = normal_rng(0, 1) ;
+  sd_prior = normal_rng(0, 1) ;
+  w1_prior = 0.5 + inv_logit(normal_rng(0, 1))/2 ;
+  w2_prior = 0.5 + inv_logit(normal_rng(0, 1))/2 ;
+  for (n in 1:N)
+    log_lik[n]= normal_lpdf(l_y[n] | bias + weight1 * l_FirstRating[n] + weight2 * l_GroupRating[n], sd);
+}
+
+"
+
+write_stan_file(
+  stan_WB_model,
+  dir = "stan/",
+  basename = "W9_WB.stan")
+```
+
+```{r}
+file <- file.path("stan/W9_WB.stan")
+mod_wb <- cmdstan_model(file, cpp_options = list(stan_threads = TRUE),
+                     stanc_options = list("O1"))
+```
+
+#Fitting the model
+```{r}
+
+samples_weighted <- mod_wb$sample(
+  data = data_weightedBayes,
+  seed = 123,
+  chains = 2,
+  parallel_chains = 2,
+  threads_per_chain = 2,
+  iter_warmup = 1500,
+  iter_sampling = 3000,
+  refresh = 500
+)
+```
+
+#Model evaluation
+```{r}
+samples_weighted$cmdstan_diagnose()
+```
+
+```{r}
+samples_weighted$summary()
+```
+
+```{r}
+samples_weighted$loo()
+```
+
+```{r}
+draws_df <- as_draws_df(samples_weighted$draws())
+
+cp3 <- ggplot(draws_df, aes(.iteration, bias, group = .chain, color = .chain)) +
+  geom_line(alpha = 0.5) +
+  theme_classic()
+
+cp4 <- ggplot(draws_df, aes(.iteration, sd, group = .chain, color = .chain)) +
+  geom_line(alpha = 0.5) +
+  theme_classic()
+
+cp5 <- ggplot(draws_df, aes(.iteration, w1, group = .chain, color = .chain)) +
+  geom_line(alpha = 0.5) +
+  theme_classic()
+
+cp6 <- ggplot(draws_df, aes(.iteration, w2, group = .chain, color = .chain)) +
+  geom_line(alpha = 0.5) +
+  theme_classic()
+
+cp3 + cp4 + cp5 + cp6
+```
+
+
+```{r}
+pp3 <- ggplot(draws_df) +
+  geom_density(aes(bias), alpha = 0.6, fill = "lightblue") +
+  geom_density(aes(bias_prior), alpha = 0.6, fill = "pink") +
+  geom_vline(xintercept = db$bias[1]) +
+  theme_bw()
+
+pp4 <- ggplot(draws_df) +
+  geom_density(aes(sd), alpha = 0.6, fill = "lightblue") +
+  geom_density(aes(sd_prior), alpha = 0.6, fill = "pink") +
+  #geom_vline(xintercept = db$sd[1]) +
+  theme_bw()
+
+pp5 <- ggplot(draws_df) +
+  geom_density(aes(w1), alpha = 0.6, fill = "lightblue") +
+  geom_density(aes(w1_prior), alpha = 0.6, fill = "pink") +
+  geom_vline(xintercept = db$w1[1]) +
+  theme_bw()
+
+pp6 <- ggplot(draws_df) +
+  geom_density(aes(w2), alpha = 0.6, fill = "lightblue") +
+  geom_density(aes(w2_prior), alpha = 0.6, fill = "pink") +
+  geom_vline(xintercept = db$w2[1]) +
+  theme_bw()
+
+pp3 + pp4 + pp5 + pp6
+```
+
+```{r}
+a <- ggplot(draws_df) +
+  geom_point(aes(bias, w1), alpha = 0.3) +
+  theme_bw()
+
+b <- ggplot(draws_df) +
+  geom_point(aes(bias, w1), alpha = 0.3) +
+  theme_bw()
+
+c <- ggplot(draws_df) +
+  geom_point(aes(bias, w2), alpha = 0.3) +
+  theme_bw()
+
+d <- ggplot(draws_df) +
+  geom_point(aes(sd, w1), alpha = 0.3) +
+  theme_bw()
+
+e <- ggplot(draws_df) +
+  geom_point(aes(sd, w2), alpha = 0.3) +
+  theme_bw()
+a+b+c+d+e
+```
+
+
+
+
